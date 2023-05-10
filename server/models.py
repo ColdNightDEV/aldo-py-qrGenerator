@@ -12,3 +12,4 @@ class User(db.Model):
     email = db.Column(db.String(345), unique=True)
     password = db.Column(db.Text, nullable=False)
     qr_code = db.Column(db.String(255))
+    paid = db.Column(db.Boolean, default=False)  # New field to track payment status

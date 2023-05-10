@@ -5,6 +5,7 @@ from config import ApplicationConfig
 from models import db, User
 import qrcode
 from io import BytesIO
+import requests
 import base64
 
 
@@ -23,18 +24,27 @@ with app.app_context():
 @app.route('/@me')
 def get_current_user():
     user_id = session.get("user_id")
-    
+
     if not user_id:
         return jsonify({
             "error": "unauthorized"
         }), 401
-        
+
     user = User.query.filter_by(id=user_id).first()
-    return jsonify({
+
+    if not user:
+        return jsonify({
+            "error": "User not found"
+        }), 404
+
+    response = {
         "id": user.id,
         "email": user.email,
-        "qr_code": user.qr_code
-    })
+        "qr_code": user.qr_code,
+        "paid": user.paid  # Add the "paid" field to the response
+    }
+
+    return jsonify(response)
 
     
     
@@ -57,7 +67,7 @@ def register_user():
     img.save(buffer)
     img_str = base64.b64encode(buffer.getvalue()).decode()
     
-    new_user = User(email=email, password=hashed_password, qr_code=img_str)
+    new_user = User(email=email, password=hashed_password, qr_code=img_str, paid=False)  # Set paid to False
     
     db.session.add(new_user)
     db.session.commit()
@@ -65,8 +75,10 @@ def register_user():
     return jsonify({
         "id": new_user.id,
         "email": new_user.email,
-        "qr_code": new_user.qr_code
+        "qr_code": new_user.qr_code,
+        "paid": new_user.paid
     })
+
 
     
 
@@ -88,8 +100,89 @@ def login_user():
     return jsonify({
         "id": user.id,
         "email": user.email,
-        "qr_code": user.qr_code  # Return the QR code path from the user model
+        "qr_code": user.qr_code,  # Return the QR code path from the user model
+        "paid": user.paid
     })
+    
+    
+@app.route("/pay/<user_id>", methods=["POST"])
+def pay_for_qr_code(user_id):
+    # Retrieve the user from the database
+    PAYSTACK_SECRET_KEY = "sk_test_9080fa15f69abfac244cb0f461282c7f25ca2751"
+    user = User.query.filter_by(id=user_id).first()
+
+    # Check if the user exists
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    try:
+        # Make a payment request to Paystack API to initiate payment
+        response = requests.post(
+            'https://api.paystack.co/transaction/initialize',
+            json={
+                'amount': 5000,  # Specify the payment amount
+                'email': user.email,  # Provide the user's email
+            },
+            headers={
+                'Authorization': f'Bearer {PAYSTACK_SECRET_KEY}',  # Set your Paystack secret key here
+                'Content-Type': 'application/json',
+            }
+        )
+
+        data = response.json()
+        authorization_url = data['data']['authorization_url']
+        payment_reference = data['data']['reference']
+
+        # Update the user's payment reference in the database
+        user.payment_reference = payment_reference
+        db.session.commit()
+
+        return jsonify({"authorization_url": authorization_url})
+
+    except Exception as e:
+        print('Payment initiation failed:', str(e))
+        return jsonify({"error": "Payment initiation failed"}), 500
+    
+    
+
+
+@app.route("/verify_payment", methods=["POST"])
+def verify_payment():
+    # Retrieve the payment reference from the request
+    PAYSTACK_SECRET_KEY = "sk_test_9080fa15f69abfac244cb0f461282c7f25ca2751"
+    payment_reference = request.json.get("payment_reference")
+
+    # Make a request to the Paystack API to verify the payment
+    response = requests.get(
+        f"https://api.paystack.co/transaction/verify/{payment_reference}",
+        headers={
+            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",  # Set your Paystack secret key here
+            "Content-Type": "application/json",
+        }
+    )
+
+    # Check the response status code
+    if response.status_code != 200:
+        return jsonify({"error": "Payment verification failed"}), 400
+
+    # Retrieve the verification result from the response
+    verification_data = response.json()
+
+    # Check if the payment was successful
+    if verification_data["data"]["status"] == "success":
+        # Retrieve the user from the database based on the payment reference
+        user = User.query.filter_by(payment_reference=payment_reference).first()
+
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        # Update the user's payment status if the payment is successful
+        user.paid = True
+        db.session.commit()
+
+        return jsonify({"paid": user.paid})
+
+    return jsonify({"paid": False})
 
 
 
