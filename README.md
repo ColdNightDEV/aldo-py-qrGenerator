@@ -1,0 +1,2 @@
+# aldo-py-qrGenerator
+ 
