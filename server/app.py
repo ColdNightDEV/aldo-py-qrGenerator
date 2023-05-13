@@ -1,11 +1,13 @@
-from flask import Flask, request, jsonify, session, redirect, url_for
+from flask import Flask, request, jsonify, session
 from flask_bcrypt import Bcrypt
 from flask_session import Session
 from config import ApplicationConfig
-from models import db, User
+from models import db, User, Referral
 import qrcode
 from io import BytesIO
 import requests
+import string
+import random
 import base64
 
 app = Flask(__name__)
@@ -31,21 +33,44 @@ def get_current_user():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
+    referred_users = User.query.join(Referral, Referral.referred_id == User.id).filter(Referral.referrer_id == user.id).all()
+
     response = {
         "id": user.id,
         "email": user.email,
         "qr_code": user.qr_code,
         "paid": user.paid,
-        "payment_reference": user.payment_reference  # Include the payment_reference in the response
+        "payment_reference": user.payment_reference,
+        "referred_user_emails": [referred_user.email for referred_user in referred_users],
+        "referred_user_ids": [referred_user.id for referred_user in referred_users]
     }
 
     return jsonify(response)
+
+
+
+def generate_referral_id():
+    characters = string.ascii_letters + string.digits
+    referral_id = ''.join(random.choices(characters, k=8))
+    existing_user = User.query.filter_by(referral_id=referral_id).first()
+    if existing_user:
+        return generate_referral_id()  # Regenerate if the referral ID already exists
+    return referral_id
 
 
 @app.route("/register", methods=["POST"])
 def register_user():
     email = request.json["email"]
     password = request.json["password"]
+    first_name = request.json["first_name"]
+    last_name = request.json["last_name"]
+    phone_number = request.json["phone_number"]
+    state_of_origin = request.json["state_of_origin"]
+    date_of_birth = request.json["date_of_birth"]
+    local_government = request.json["local_government"]
+    gender = request.json["gender"]
+    next_of_kin = request.json["next_of_kin"]
+    referral_code = request.json.get("referral_code", None)  # Optional field, set to None if not provided
 
     user_exists = User.query.filter_by(email=email).first() is not None
 
@@ -61,7 +86,27 @@ def register_user():
     img.save(buffer)
     img_str = base64.b64encode(buffer.getvalue()).decode()
 
-    new_user = User(email=email, password=hashed_password, qr_code=img_str, paid=False)  # Set paid to False
+    referral_id = generate_referral_id()
+
+    # Create the referral link
+    referral_link = f"http://localhost:5000/invite/{referral_id}"
+
+    new_user = User(
+        email=email,
+        password=hashed_password,
+        qr_code=img_str,
+        paid=False,
+        first_name=first_name,
+        last_name=last_name,
+        phone_number=phone_number,
+        state_of_origin=state_of_origin,
+        date_of_birth=date_of_birth,
+        local_government=local_government,
+        gender=gender,
+        next_of_kin=next_of_kin,
+        referral_code=referral_code,
+        referral_id=referral_id
+    )
 
     db.session.add(new_user)
     db.session.commit()
@@ -71,7 +116,18 @@ def register_user():
         "email": new_user.email,
         "qr_code": new_user.qr_code,
         "paid": new_user.paid,
-        "payment_reference": new_user.payment_reference  # Include the payment_reference in the response
+        "payment_reference": new_user.payment_reference,
+        "first_name": new_user.first_name,
+        "last_name": new_user.last_name,
+        "phone_number": new_user.phone_number,
+        "state_of_origin": new_user.state_of_origin,
+        "date_of_birth": new_user.date_of_birth,
+        "local_government": new_user.local_government,
+        "gender": new_user.gender,
+        "next_of_kin": new_user.next_of_kin,
+        "referral_code": new_user.referral_code,
+        "referral_id": referral_id,
+        "referral_link": referral_link
     }
 
     return jsonify(response)
@@ -123,7 +179,7 @@ def pay_for_qr_code(user_id):
                 'metadata': {
                     'user_id': user.id,  # Include the user_id in metadata
                 },
-                'callback_url': f"https://loacalhost:5000/pay/{user_id}/verify"  # Set the callback URL
+                'callback_url': f"https://localhost:5000/pay/{user_id}/verify"  # Set the callback URL
             },
             headers={
                 'Authorization': f'Bearer {PAYSTACK_SECRET_KEY}',  # Set your Paystack secret key here
@@ -179,7 +235,7 @@ def verify_payment(user_id):
     # Check if the payment was successful
     if verification_data["data"]["status"] == "success":
         # Retrieve the user from the database based on the user ID
-        user = User.query.filter_by(id=user_id).first()
+        user = User.query.get(user_id)
 
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -196,57 +252,81 @@ def verify_payment(user_id):
 
         return jsonify(response)
 
+    # Return a response indicating the payment was not successful
     return jsonify({"paid": False})
 
 
-# @app.route("/verify_payment", methods=["POST"])
-# def verify_payment():
-#     PAYSTACK_SECRET_KEY = "sk_test_9080fa15f69abfac244cb0f461282c7f25ca2751"
-    
-#     try:
-#         # Retrieve the payment reference from the request
-#         payment_reference = request.json.get("payment_reference")
+@app.route("/invite/<referral_id>", methods=["GET", "POST"])
+def handle_referral_registration(referral_id):
+    # Check if the referral ID exists
+    referrer = User.query.filter_by(referral_id=referral_id).first()
+    if not referrer:
+        return jsonify({"error": "Invalid referral ID"}), 404
 
-#         # Make a request to the Paystack API to verify the payment
-#         response = requests.get(
-#             f"https://api.paystack.co/transaction/verify/{payment_reference}",
-#             headers={
-#                 "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-#                 "Content-Type": "application/json",
-#             }
-#         )
+    if request.method == "GET":
+        return jsonify({"referrer_id": referrer.id}), 200
 
-#         # Check the response status code
-#         if response.status_code != 200:
-#             return jsonify({"error": "Payment verification failed"}), 400
+    # Parse request data for new user registration
+    email = request.json.get("email")
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
 
-#         # Retrieve the verification result from the response
-#         verification_data = response.json()
+    # Check if the email already exists
+    existing_user = User.query.filter_by(email=email).first()
+    if existing_user:
+        return jsonify({"error": "Email already exists"}), 409
 
-#         # Check if the payment was successful
-#         if verification_data["data"]["status"] == "success":
-#             # Retrieve the user from the database based on the payment reference
-#             user = User.query.filter_by(payment_reference=payment_reference).first()
+    password = request.json.get("password")
+    first_name = request.json.get("first_name")
+    last_name = request.json.get("last_name")
+    phone_number = request.json.get("phone_number")
+    state_of_origin = request.json.get("state_of_origin")
+    date_of_birth = request.json.get("date_of_birth")
+    local_government = request.json.get("local_government")
+    gender = request.json.get("gender")
+    next_of_kin = request.json.get("next_of_kin")
 
-#             if not user:
-#                 return jsonify({"error": "User not found"}), 404
+    # Create the new user
+    new_user = User(
+        email=email,
+        password=password,
+        qr_code=None,
+        paid=False,
+        first_name=first_name,
+        last_name=last_name,
+        phone_number=phone_number,
+        state_of_origin=state_of_origin,
+        date_of_birth=date_of_birth,
+        local_government=local_government,
+        gender=gender,
+        next_of_kin=next_of_kin,
+        referral_code=None,
+        referral_id=None
+    )
 
-#             # Update the user's payment status if the payment is successful
-#             user.paid = True
-#             db.session.commit()
+    # Add the new user to the database
+    db.session.add(new_user)
+    db.session.commit()
 
-#             response = {
-#                 "paid": user.paid,
-#                 "payment_reference": user.payment_reference
-#             }
+    # Record referral if referrer exists
+    referral = Referral(referrer_id=referrer.id, referred_id=new_user.id)
+    db.session.add(referral)
+    db.session.commit()
 
-#             return jsonify(response)
+    # Update the referral information for the referrer
+    referrer.referrals_made.append(referral)
+    db.session.commit()
 
-#         return jsonify({"paid": False})
+    response = {
+        "id": new_user.id,
+        "email": new_user.email,
+        # Other user attributes
+        "referrer_id": referrer.id
+    }
 
-#     except Exception as e:
-#         print('Payment verification failed:', str(e))
-#         return jsonify({"error": "Payment verification failed"}), 500
+    return jsonify(response), 200
+
+
 
 
 if __name__ == "__main__":
